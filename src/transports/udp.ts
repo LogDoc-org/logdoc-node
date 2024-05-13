@@ -6,8 +6,7 @@ import * as dgram from 'node:dgram';
 class UdpTransport {
   private client: dgram.Socket;
   private config: Config;
-  constructor(config: Config) {
-    this.client = dgram.createSocket('udp4');
+  constructor(config: Config) {    
     this.config = config;
   }
 
@@ -89,13 +88,14 @@ class UdpTransport {
   send(message: Message) {
     const readyMessages = this.#prepareUdpMessages(message);
     readyMessages.forEach((chunk) => {
-      this.client.send(
+      const client = dgram.createSocket('udp4');
+      client.send(
         new Uint8Array(chunk),
         this.config.port,
         this.config.host,
         (err) => {
           if (err) throw err;
-          this.client.close();
+          client.close();
         },
       );
     });
