@@ -2,81 +2,104 @@ import { Config } from '../';
 import { Message } from './';
 import * as net from 'net';
 
+const HEADER = Buffer.from([6, 3]);
+const MAX_QUEUE = 10_000; // drop oldest beyond this — logging must not grow unbounded
+const INITIAL_RETRY_MS = 500;
+const MAX_RETRY_MS = 30_000;
+
+/**
+ * TCP transport: one persistent connection, lazy connect on first send,
+ * a bounded write queue while (re)connecting, reconnect with backoff.
+ * Values containing a newline are encoded as complex (binary) pairs
+ * per the ld_format spec: KEY '\n' be-uint32(len) VALUE.
+ */
 class TcpTransport {
-  private client: net.Socket;
   private config: Config;
+  private socket: net.Socket | null = null;
+  private connecting = false;
+  private retryTimer: NodeJS.Timeout | null = null;
+  private retryDelay = INITIAL_RETRY_MS;
+  private queue: Buffer[] = [];
+  private lastError: Error | null = null;
+
   constructor(config: Config) {
-    this.client = new net.Socket();
     this.config = config;
   }
 
-  #writeInt(value: string | number | boolean) {
-    const size = Buffer.byteLength(`${value}`);
-    return Buffer.alloc(4).write(`${size}`);
-  }
-
-  #writeComplexPair(
-    key: string,
-    value: string | number | boolean,
-    buffer: number[],
-  ) {
-    const newBuffer = [] as number[];
-    newBuffer
-      .concat(Array.from(Buffer.from(key, 'utf8')))
-      .concat(Array.from(Buffer.from('\n', 'utf8')))
-      .concat(this.#writeInt(value))
-      .concat(Array.from(Buffer.from(`${value}`, 'utf8')));
-    return buffer.concat(newBuffer);
-  }
-  #writeSimplePair(
-    key: string,
-    value: string | number | boolean,
-    buffer: number[],
-  ) {
-    return buffer.concat(
-      Array.from(Buffer.from(key + '=' + value + '\n', 'utf8')),
-    );
-  }
-
-  // TODO Сделадь мультистрочные
-  #writePair(key: string, value: string | number | boolean, buffer: number[]) {
-    // if (value && typeof value === "string" && value?.indexOf('\n')) {
-    //     return this.#writeComplexPair(key, value, buffer)
-    // }else {
-    return this.#writeSimplePair(key, value, buffer);
-    // }
-  }
-
-  #prepareTCPMessage(message: Message): number[] {
-    let arrayOfBytes = [6, 3];
-    for (const key in message) {
-      arrayOfBytes = this.#writePair(key, message[key], arrayOfBytes);
+  send(message: Message): void {
+    if (this.queue.length >= MAX_QUEUE) {
+      this.queue.shift();
     }
-    arrayOfBytes = arrayOfBytes.concat(Array.from(Buffer.from('\n', 'utf8')));
-    return arrayOfBytes;
+    this.queue.push(this.encode(message));
+    if (this.socket) {
+      this.flush();
+    } else {
+      this.connect();
+    }
   }
 
-  send(message: Message) {
-    const readyMessage = this.#prepareTCPMessage(message);
-    this.client.connect(this.config.port, this.config.host, () => {
-      this.client.write(new Uint8Array(readyMessage));
-      this.client.setKeepAlive(true, 120000);
-      this.client.destroy();
+  private encode(message: Message): Buffer {
+    const parts: Buffer[] = [HEADER];
+    for (const key in message) {
+      const value = `${message[key]}`;
+      const safeKey = key.replace(/[=\n]/g, '_');
+      if (value.includes('\n')) {
+        const valueBuf = Buffer.from(value, 'utf8');
+        const len = Buffer.alloc(4);
+        len.writeUInt32BE(valueBuf.length);
+        parts.push(Buffer.from(`${safeKey}\n`, 'utf8'), len, valueBuf);
+      } else {
+        parts.push(Buffer.from(`${safeKey}=${value}\n`, 'utf8'));
+      }
+    }
+    parts.push(Buffer.from('\n', 'utf8'));
+    return Buffer.concat(parts);
+  }
+
+  private flush() {
+    while (this.socket && this.queue.length > 0) {
+      this.socket.write(new Uint8Array(this.queue.shift() as Buffer));
+    }
+  }
+
+  private connect() {
+    if (this.connecting || this.socket || this.retryTimer) return;
+    this.connecting = true;
+
+    const socket = net.createConnection({
+      host: this.config.host,
+      port: this.config.port,
+    });
+    socket.setKeepAlive(true, 120_000);
+
+    socket.on('connect', () => {
+      this.connecting = false;
+      this.retryDelay = INITIAL_RETRY_MS;
+      this.socket = socket;
+      this.flush();
     });
 
-    this.client.on('data', () => {
-      this.client.destroy();
+    // 'close' always follows 'error', so reconnect logic lives in one place.
+    socket.on('error', (err) => {
+      this.lastError = err;
     });
+    socket.on('close', () => {
+      if (this.socket === socket) this.socket = null;
+      this.connecting = false;
+      socket.destroy();
+      if (this.queue.length > 0) this.scheduleReconnect();
+    });
+  }
 
-    this.client.on('error', (err) => {
-      console.error('Error LogDoc', err);
-      this.client.destroy();
-    });
-
-    this.client.on('close', () => {
-      this.client.destroy();
-    });
-    return;
+  private scheduleReconnect() {
+    if (this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.connect();
+    }, this.retryDelay);
+    // Timers must not keep the host process alive.
+    this.retryTimer.unref?.();
+    this.retryDelay = Math.min(this.retryDelay * 2, MAX_RETRY_MS);
   }
 }
 export default TcpTransport;
